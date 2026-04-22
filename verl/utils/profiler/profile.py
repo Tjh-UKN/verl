@@ -97,6 +97,7 @@ class DistProfiler:
         self._tool = getattr(config, "tool", None)
         self._enable = config.enable
         self._this_step = False
+        self._last_start_result = None
 
         # Normalize rank selection
         self._this_rank = False
@@ -154,11 +155,17 @@ class DistProfiler:
     def start(self, **kwargs):
         if self.check_enable() and self.check_this_rank():
             self._this_step = True
-            return getattr(self._impl, "start", lambda **_: None)(**kwargs)
+            result = getattr(self._impl, "start", lambda **_: None)(**kwargs)
+            self._last_start_result = result
+            return result
 
     def stop(self):
         if self.check_enable() and self.check_this_rank():
             self._this_step = False
+            if self._tool == "precision_debugger":
+                started = bool(self._last_start_result)
+                self._last_start_result = None
+                return getattr(self._impl, "stop", lambda **_: None)(started=started)
             return getattr(self._impl, "stop", lambda: None)()
 
     @classmethod

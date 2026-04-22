@@ -30,6 +30,7 @@ _STAGE_TO_ROLE = {
     "compute_values": "critic",
     "critic_update": "critic",
     "compute_rm_score": "reward_model",
+    "rollout_generate": "rollout",
 }
 
 _MODEL_ATTRS_BY_ROLE = {
@@ -60,9 +61,10 @@ _MODEL_ATTRS_BY_ROLE = {
         "reward_model_module",
         "rm.reward_model_module",
     ),
+    "rollout": (),
 }
 
-_SKIP_STAGES = {"rollout_generate"}
+_SKIP_STAGES = set()
 
 
 class PrecisionDebuggerProfiler:

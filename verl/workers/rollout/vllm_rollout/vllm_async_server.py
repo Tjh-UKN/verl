@@ -136,10 +136,12 @@ class vLLMHttpServer:
         profiler_config = self.config.profiler
         tool_config = None
         if profiler_config is not None:
-            if profiler_config.tool in ["torch", "npu"]:
+            if profiler_config.tool in ["torch", "npu", "precision_debugger"]:
                 tool_config = omega_conf_to_dataclass((profiler_config.tool_config or {}).get(profiler_config.tool))
             else:
-                logger.warning(f"agent loop only support torch and npu profiler, got {profiler_config.tool}")
+                logger.warning(
+                    f"agent loop only support torch/npu/precision_debugger profiler, got {profiler_config.tool}"
+                )
                 profiler_config = None
         self.profiler_controller = DistProfiler(self.replica_rank, config=profiler_config, tool_config=tool_config)
 
@@ -389,8 +391,13 @@ class vLLMHttpServer:
 
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
+        precision_debugger_config = self._get_precision_debugger_worker_config()
         await engine_client.collective_rpc(
-            method="monkey_patch_model", kwargs={"vocab_size": len(self.model_config.tokenizer)}
+            method="monkey_patch_model",
+            kwargs={
+                "vocab_size": len(self.model_config.tokenizer),
+                "precision_debugger_config": precision_debugger_config,
+            },
         )
 
         build_app_sig = inspect.signature(build_app)
@@ -578,20 +585,31 @@ class vLLMHttpServer:
             logger.info("skip sleep in standalone mode")
 
     async def start_profile(self, **kwargs):
-        if (
-            self.profiler_controller.check_enable()
-            and self.profiler_controller.check_this_rank()
-            and self.profiler_controller.is_discrete_mode()
-        ):
-            await self.engine.start_profile(**kwargs)
+        if self.node_rank != 0 and not hasattr(self, "engine"):
+            return
+        if self.profiler_controller.check_enable() and self.profiler_controller.check_this_rank():
+            if self.profiler_controller.config.tool == "precision_debugger":
+                profile_step = kwargs.get("profile_step", kwargs.get("global_step", self.global_steps))
+                await self.engine.collective_rpc(
+                    method="set_precision_debugger_profile",
+                    kwargs={"enabled": True, "profile_step": profile_step},
+                )
+                return
+            if self.profiler_controller.is_discrete_mode():
+                await self.engine.start_profile(**kwargs)
 
     async def stop_profile(self):
-        if (
-            self.profiler_controller.check_enable()
-            and self.profiler_controller.check_this_rank()
-            and self.profiler_controller.is_discrete_mode()
-        ):
-            await self.engine.stop_profile()
+        if self.node_rank != 0 and not hasattr(self, "engine"):
+            return
+        if self.profiler_controller.check_enable() and self.profiler_controller.check_this_rank():
+            if self.profiler_controller.config.tool == "precision_debugger":
+                await self.engine.collective_rpc(
+                    method="set_precision_debugger_profile",
+                    kwargs={"enabled": False, "profile_step": None},
+                )
+                return
+            if self.profiler_controller.is_discrete_mode():
+                await self.engine.stop_profile()
 
     async def clear_kv_cache(self):
         if self.node_rank == 0:
@@ -851,6 +869,31 @@ class vLLMHttpServer:
     def _get_wake_up_tags(self) -> list[str]:
         """Return the tags passed to engine.wake_up(). Default includes kv_cache."""
         return ["kv_cache", "weights"]
+
+    def _get_precision_debugger_worker_config(self) -> Optional[dict[str, Any]]:
+        """Build precision debugger config for vLLM worker extension."""
+        profiler_cfg = self.profiler_controller.config
+        tool_cfg = self.profiler_controller.tool_config
+        if (
+            profiler_cfg is None
+            or tool_cfg is None
+            or getattr(profiler_cfg, "tool", None) != "precision_debugger"
+            or not self.profiler_controller.check_enable()
+            or not getattr(tool_cfg, "config_path", None)
+        ):
+            return None
+
+        configured_stages = getattr(tool_cfg, "stages", None)
+        stage = "rollout_generate"
+        if configured_stages is not None and stage not in configured_stages:
+            return None
+
+        return {
+            "config_path": tool_cfg.config_path,
+            "dump_root": profiler_cfg.save_path or "outputs/profile",
+            "strict": bool(getattr(tool_cfg, "strict", False)),
+            "stage": stage,
+        }
 
     async def _sleep_hybrid(self):
         """HYBRID sleep: lora adapters only need level=1; full weights need level=2."""

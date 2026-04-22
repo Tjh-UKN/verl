@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import ctypes
+import functools
 import json
 import logging
 import os
@@ -25,6 +26,8 @@ import torch
 from vllm.outputs import RequestOutput
 
 from verl.utils.device import is_npu_available
+from verl.utils.profiler import DistProfiler
+from verl.utils.profiler.config import PrecisionDebuggerToolConfig, ProfilerConfig
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
@@ -170,11 +173,73 @@ class vLLMColocateWorkerExtension:
         instance._is_modelopt_qat = _is_modelopt_qat
         return instance
 
-    def monkey_patch_model(self, vocab_size: int):
+    def monkey_patch_model(self, vocab_size: int, precision_debugger_config: Optional[dict[str, Any]] = None):
         # patch compute_logits to avoid sampling OOV token
         monkey_patch_compute_logits(self.model_runner.model, vocab_size)
         # patch weight loader to support MoE model
         patch_vllm_moe_model_weight_loader(self.model_runner.model)
+
+        if precision_debugger_config:
+            self._configure_precision_debugger(**precision_debugger_config)
+
+    def set_precision_debugger_profile(self, enabled: bool, profile_step: Optional[int] = None):
+        self._precision_debugger_enabled = enabled
+        self._precision_debugger_profile_step = profile_step
+
+    def _configure_precision_debugger(
+        self,
+        config_path: str,
+        dump_root: str,
+        strict: bool = False,
+        stage: str = "rollout_generate",
+    ):
+        profiler_cfg = ProfilerConfig(
+            tool="precision_debugger",
+            enable=True,
+            all_ranks=True,
+            ranks=[],
+            save_path=dump_root,
+            tool_config=None,
+            global_tool_config=None,
+        )
+        tool_cfg = PrecisionDebuggerToolConfig(
+            config_path=config_path,
+            stages=[stage],
+            strict=strict,
+        )
+        self._precision_debugger_profiler = DistProfiler(rank=0, config=profiler_cfg, tool_config=tool_cfg)
+        self._precision_debugger_stage = stage
+        self._precision_debugger_enabled = False
+        self._precision_debugger_profile_step = None
+        self._wrap_forward_with_precision_debugger()
+
+    def _wrap_forward_with_precision_debugger(self):
+        model = self.model_runner.model
+        if getattr(model, "_verl_precision_debugger_forward_wrapped", False):
+            return
+
+        original_forward = model.forward
+
+        @functools.wraps(original_forward)
+        def forward_with_precision_debugger(model_self, *args, **kwargs):
+            if not getattr(self, "_precision_debugger_enabled", False):
+                return original_forward(*args, **kwargs)
+
+            step = getattr(self, "_precision_debugger_profile_step", None)
+            stage = getattr(self, "_precision_debugger_stage", "rollout_generate")
+            profiler = getattr(self, "_precision_debugger_profiler", None)
+            if profiler is None:
+                return original_forward(*args, **kwargs)
+
+            profiler.start(stage=stage, global_step=step, model=model_self)
+
+            try:
+                return original_forward(*args, **kwargs)
+            finally:
+                profiler.stop()
+
+        model.forward = MethodType(forward_with_precision_debugger, model)
+        model._verl_precision_debugger_forward_wrapped = True
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
